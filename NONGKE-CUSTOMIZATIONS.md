@@ -13,6 +13,7 @@
 |---|---|---|---|---|---|---|
 | 1 | 计划 | `src-tauri/src/config/constants.rs` | `DSH_CORE_URL` 一行常量改为自管发版中心（agent_platform 托管预补丁内核 tarball） | D1 定稿：路线甲形态 3（2026-10-13） | **未实施**（P0 落地） | 恢复常量即回官方源 |
 | 2 | 计划 | `src-tauri/tauri.conf.json` 等 | 品牌与出包（productName/identifier/icons/Updater 配置）；identifier 变更会切换 AppData 目录，须与数据迁移方案同评审 | 农科小智品牌 | **未实施**（P0 落地，nongke/brand 分支） | 还原配置 |
+| 3 | 新增模块 | `src-tauri/src/service/enterprise/`、`src-tauri/src/bridge/enterprise.rs`（+ mod/builder 各一行挂载） | 农科小智企业门禁：SSO 登录回路（loopback listener + opener 开系统浏览器 + 一次性 code 换平台会话 cookie）+ 交接文件 `<DSH_HOME>/enterprise/agent-platform-session.json`（0600 原子写，格式与 Electron 版 `session-handoff.ts` 一致）；命令 `enterprise_login/logout/status` | WebView 读不到系统浏览器 HttpOnly cookie；平台侧配套端点在 agent_platform（`services/desktop_sso.py` + `/oauth/login?desktop_port=` + `POST /api/auth/desktop/exchange`） | **已实施**（nongke/enterprise-sso 分支，2026-10-13，`cargo check/test` 绿；平台侧 TestClient 冒烟 6/6） | 删模块即回上游形态（对 upstream 提交永不依赖） |
 
 ## 说明
 
