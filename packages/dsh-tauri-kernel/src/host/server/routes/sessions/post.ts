@@ -13,5 +13,13 @@ export default defineEventHandler<EventHandlerRequest, Promise<{ sessionId: stri
   }
   if (body.workspaceId !== undefined && body.cwd !== undefined)
     throw new HTTPError({ statusCode: 400, message: 'BRIDGE_LOCATION_INVALID: workspaceId 与 cwd 不能同时指定。' })
-  return session.create(body.backend, body.workspaceId, body.cwd, body.agentPreset)
+  try {
+    return await session.create(body.backend, body.workspaceId, body.cwd, body.agentPreset)
+  }
+  catch (error) {
+    const message = error instanceof Error ? error.message : ''
+    if (!message.startsWith('BRIDGE_'))
+      throw error
+    throw new HTTPError({ statusCode: 400, message })
+  }
 })

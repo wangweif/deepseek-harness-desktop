@@ -10,6 +10,7 @@ import type { NativeSession } from '../backends/types'
 import type { HostContext, PlatformLoader, RuntimeModules } from '../types'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
+import { join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
@@ -309,6 +310,21 @@ describe('exported bridge plugin HTTP dependency boundary', () => {
     expect(requestRejection.mock.calls[0]![0].method).toBe('GET')
     expect(vi.mocked(detectBackend).mock.calls.map(([id]) => id).sort()).toEqual(['claude', 'codex'])
     expect(projections.stateOf(sessionModule.Session.create(sessionModule.SessionId('guard-regression')), 'bridgeKernel')?.binding).toBeNull()
+  })
+
+  it('answers an unusable session location with the bridge reason instead of an opaque server error', async () => {
+    const base = await start()
+    const cases = [
+      { body: { backend: 'codex', cwd: join(cwd, 'bridge-missing-session-directory') }, reason: 'BRIDGE_CWD_INVALID: 会话目录必须是已存在的绝对目录。' },
+      { body: { backend: 'codex', workspaceId: 'bridge-missing-workspace' }, reason: 'BRIDGE_WORKSPACE_NOT_FOUND: 工作区不存在。' },
+    ] as const
+    for (const { body, reason } of cases) {
+      const response = await fetch(`${base}/api/tauri/bridge/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ message: reason })
+    }
+    expect(createCodexSession).not.toHaveBeenCalled()
+    expect(runtime.sessions.size).toBe(0)
   })
 
   it.each([401, 403] as const)('preserves connection rejection %s on every declared bridge route before native detection', async (status) => {

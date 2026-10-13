@@ -7,21 +7,24 @@ import type { NativeSession } from '../backends/types'
 import type { HostContext, PlatformLoader, RuntimeModules } from '../types'
 import type { DetectedCommand } from '../utils/detection'
 import { createRequire } from 'node:module'
+import { join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { AgentLoop } from '@deepseek-ai/dsh-agent-loop'
 import * as llmModule from '@deepseek-ai/dsh-llm'
+import { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
 import { assertContiguous, materializeAppendBatch, materializeCreateHeader, SessionPersistence, SessionPersistenceRevision, validateStoredEvents } from '@deepseek-ai/dsh-session-persistence'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
+import { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as zodModule from 'zod'
 import { apply } from '../apply'
 import { createClaudeSession } from '../backends/claude'
 import { createCodexSession } from '../backends/codex'
-import { BRIDGE_PROVIDER } from '../config/constants'
+import { BRIDGE_PROVIDER, SESSION_TITLE_PURPOSE } from '../config/constants'
 import { resetRuntime, runtime } from '../config/runtime'
 import { detectBackend } from '../utils/detection'
 import { adapter } from './adapter'
@@ -354,6 +357,84 @@ function observe(agent: Agent) {
   })
   return { events, frames, endEvents }
 }
+
+describe('native session title requests', () => {
+  it('still rejects non-title auxiliary requests before opening a native session', async () => {
+    const connection = native('auxiliary-owner')
+    vi.mocked(createCodexSession).mockResolvedValueOnce(connection)
+    await creating()
+    const agent = officialHandle!.agent
+    const signal = new AbortController().signal
+    const call = await context.llm.prepareCall({ provider: BRIDGE_PROVIDER, model: 'codex' }, signal)
+    const request = async () => {
+      for await (const chunk of call.stream({ ...call.config, messages: [], purpose: 'compaction', sessionId: agent.id, signal }))
+        expect.fail(`unexpected auxiliary chunk: ${JSON.stringify(chunk)}`)
+    }
+    await expect(request()).rejects.toThrow('BRIDGE_AUXILIARY_REQUEST')
+    expect(createCodexSession).toHaveBeenCalledOnce()
+    expect(connection.submit).not.toHaveBeenCalled()
+  })
+
+  it.each(['codex', 'claude'] as const)('routes %s titles to the default model without opening another native session', async (id) => {
+    const connection = native(`conversation-${id}`)
+    const factory = vi.mocked(id === 'codex' ? createCodexSession : createClaudeSession)
+    factory.mockResolvedValueOnce(connection)
+    await creating(id)
+    const agent = officialHandle!.agent
+    const before = agent.session.snapshotEvents()
+    const requests: llmModule.GenerateOptions[] = []
+    class TitleAdapter extends llmModule.LlmAdapter {
+      async* stream(options: llmModule.GenerateOptions): AsyncIterable<llmModule.StreamChunk> {
+        requests.push(options)
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: '修复会话标题' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '修复会话标题' } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
+    }
+    context.llm.registerAdapter(['title-provider'], new TitleAdapter())
+    context.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'title-provider', model: 'title-model' }) } as HostContext['agentDefaultModel'])
+    const controller = new AbortController()
+    const signal = controller.signal
+    const call = await context.llm.prepareCall({ provider: BRIDGE_PROVIDER, model: id, maxTokens: 64 }, signal)
+    const input: llmModule.GenerateOptions = {
+      ...call.config,
+      messages: [llmModule.createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'name this session' }] })],
+      system: 'Return only a short title.',
+      purpose: SESSION_TITLE_PURPOSE,
+      sessionId: agent.id,
+      signal,
+    }
+    const assembler = new llmModule.BlockAssembler()
+    for await (const chunk of call.stream(input))
+      assembler.push(chunk)
+    expect(assembler.blocks()).toEqual([{ type: 'text', text: '修复会话标题' }])
+    expect(assembler.finish).toEqual({ kind: 'stop' })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ ...input, provider: 'title-provider', model: 'title-model', signal: expect.any(AbortSignal) })
+    expect(factory).toHaveBeenCalledOnce()
+    expect(connection.submit).not.toHaveBeenCalled()
+    expect(agent.session.snapshotEvents()).toEqual(before)
+    expect(runtime.sessions.get(agent.id)!.session).toBe(connection)
+    controller.abort(new Error('cancel title'))
+    expect(requests[0]!.signal!.aborted).toBe(true)
+    expect(connection.dispose).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, { provider: BRIDGE_PROVIDER, model: 'codex' }])('rejects unavailable or recursive default title routes: %j', async (route) => {
+    vi.mocked(createCodexSession).mockResolvedValueOnce(native('title-owner'))
+    await creating()
+    context.provide('agentDefaultModel', { currentSelection: () => route } as HostContext['agentDefaultModel'])
+    const signal = new AbortController().signal
+    const call = await context.llm.prepareCall({ provider: BRIDGE_PROVIDER, model: 'codex' }, signal)
+    const request = async () => {
+      for await (const chunk of call.stream({ ...call.config, messages: [], purpose: SESSION_TITLE_PURPOSE, sessionId: officialHandle!.agent.id, signal }))
+        expect.fail(`unexpected title chunk: ${JSON.stringify(chunk)}`)
+    }
+    await expect(request()).rejects.toThrow('BRIDGE_TITLE_MODEL_UNAVAILABLE')
+    expect(createCodexSession).toHaveBeenCalledOnce()
+  })
+})
 
 describe('independent native worktree session setup', () => {
   beforeEach(() => {
@@ -905,7 +986,7 @@ describe('official cold native route restoration', () => {
     expect(restored.session.requestHeader()).toBeUndefined()
     expect(identity.resolve(restored)).toEqual(binding)
     expect(factory).toHaveBeenCalledOnce()
-    expect(runtime.coldRoutes.has(restored)).toBe(true)
+    expect(restored.session.requestHeader()).toBeUndefined()
     const resumed = native(original.id)
     factory.mockImplementationOnce(async (_command, _cwd, storedId, output) => {
       expect(storedId).toBe(original.id)
@@ -921,7 +1002,6 @@ describe('official cold native route restoration', () => {
     const replayed = restoreSerialized(restored.session)
     expect(replayed.requestHeader()?.config).toEqual({ provider: BRIDGE_PROVIDER, model: id })
     expect(replayed.snapshotEvents().filter(event => event.type === 'request/header').map(event => event.data.reason)).toEqual(['initial'])
-    expect(runtime.coldRoutes.has(restored)).toBe(false)
     expect(records(replayed)).toEqual(records(before))
     expect(replayed.deriveMessages().map(message => ({ role: message.role, content: message.content }))).toEqual([
       { role: 'user', content: [{ type: 'text', text: 'continue the cold native session' }] },
@@ -929,11 +1009,7 @@ describe('official cold native route restoration', () => {
     ])
   }, 10_000)
 
-  it.each([
-    { provider: 'cloud-provider', model: 'global-default' },
-    { provider: 'dsh-tauri-kernel', model: 'claude' },
-    { provider: 'dsh-tauri-kernel', model: 'codex', reasoningEffort: llmModule.ReasoningEffortId('high') },
-  ])('rejects an explicit cold model selection instead of restoring over it: %j', async (selected) => {
+  it('rejects a bound-session kernel switch before its first request', async () => {
     const original = native('api-cold-selected')
     vi.mocked(createCodexSession).mockResolvedValueOnce(original)
     await creating()
@@ -944,16 +1020,62 @@ describe('official cold native route restoration', () => {
     expect(found).not.toHaveProperty('error')
     if ('error' in found)
       throw found.error
+    const selected = { provider: BRIDGE_PROVIDER, model: 'claude' }
     controller.selectForNextRequest(found.agent, selected)
     await followup(found.agent, 'reject switching the bound native kernel')
-    expect(errors).toEqual([expect.objectContaining({ message: 'BRIDGE_KERNEL_IMMUTABLE: 已绑定会话不能切换内核或由 DSH 覆写原生选项。' })])
+    expect(errors).toEqual([expect.objectContaining({ message: expect.stringContaining('BRIDGE_KERNEL_IMMUTABLE') })])
     expect(createCodexSession).toHaveBeenCalledOnce()
     expect(createClaudeSession).not.toHaveBeenCalled()
     expect(original.submit).not.toHaveBeenCalled()
     expect(found.agent.session.requestHeader()).toBeUndefined()
     expect(found.agent.session.snapshotEvents().filter((event: SessionEvent) => event.type === 'model/selection').map((event: SessionEvent) => event.data)).toEqual([selected])
     expect(identity.resolve(found.agent)).toEqual({ backend: 'codex', nativeSessionId: original.id, sessionId: previous.agent.id })
-    expect(runtime.coldRoutes.has(found.agent)).toBe(false)
+    expect(() => restoreSerialized(found.agent.session)).not.toThrow()
+  }, 10_000)
+
+  it('keeps the bound kernel when a created session still receives the deployment default route', async () => {
+    const original = native('api-created-default-route')
+    vi.mocked(createCodexSession).mockResolvedValueOnce(original)
+    await creating()
+    const agent = officialHandle!.agent
+    const started = deferred<AbortSignal>()
+    const gate = deferred<void>()
+    releases.push(() => gate.resolve())
+    context.on('agent/pre-step', async ({ signal }) => {
+      started.resolve(signal)
+      await gate.promise
+      return { kind: 'reject' }
+    }, { global: true, prepend: true })
+    const turn = followup(agent, 'keep the kernel the session was created with')
+    const signal = await started.promise
+    await expect(adapter.request({ agent, signal }, async () => defaultSelection)).resolves.toEqual({ provider: BRIDGE_PROVIDER, model: 'codex' })
+    expect(identity.resolve(agent)).toEqual({ backend: 'codex', nativeSessionId: original.id, sessionId: agent.id })
+    gate.resolve()
+    await turn
+    expect(errors).toEqual([])
+  }, 10_000)
+
+  it('drops a DSH reasoning effort on the bound native route instead of failing the first turn', async () => {
+    const original = native('api-native-effort')
+    const resumed = native(original.id)
+    vi.mocked(createCodexSession).mockResolvedValueOnce(original).mockResolvedValueOnce(resumed)
+    await creating()
+    const previous = officialHandle!
+    await previous.dispose()
+    await session.remove(previous.agent.id)
+    const found = await controller.resolveAgent(previous.agent.id)
+    expect(found).not.toHaveProperty('error')
+    if ('error' in found)
+      throw found.error
+    const selected = { provider: BRIDGE_PROVIDER, model: 'codex', reasoningEffort: llmModule.ReasoningEffortId('high') }
+    controller.selectForNextRequest(found.agent, selected)
+    await followup(found.agent, 'keep the native kernel while DSH proposes an effort')
+    expect(errors).toEqual([])
+    expect(resumed.submit).toHaveBeenCalledOnce()
+    expect(resumed.submit.mock.calls[0]![2]).toEqual({ model: null, reasoningEffort: null })
+    expect(found.agent.session.requestHeader()?.config).toEqual({ provider: BRIDGE_PROVIDER, model: 'codex' })
+    expect(found.agent.session.snapshotEvents().filter((event: SessionEvent) => event.type === 'model/selection').map((event: SessionEvent) => event.data)).toEqual([selected])
+    expect(identity.resolve(found.agent)).toEqual({ backend: 'codex', nativeSessionId: original.id, sessionId: previous.agent.id })
     expect(() => restoreSerialized(found.agent.session)).not.toThrow()
   }, 10_000)
 
@@ -985,7 +1107,7 @@ describe('official cold native route restoration', () => {
     }, { global: true, prepend: true })
     const turn = followup(found.agent, 'reject overriding native options during cold resume')
     const signal = await started.promise
-    await expect(adapter.request({ agent: found.agent, signal }, async () => override)).rejects.toThrow('BRIDGE_KERNEL_IMMUTABLE: 已绑定会话不能切换内核或由 DSH 覆写原生选项。')
+    await expect(adapter.request({ agent: found.agent, signal }, async () => override)).rejects.toThrow(expect.objectContaining({ message: expect.stringContaining(`BRIDGE_KERNEL_IMMUTABLE: 已绑定会话不能切换内核或由 DSH 覆写原生选项（请求 ${override.provider}/${override.model}，当前内核 codex）。`) }))
     expect(createCodexSession).toHaveBeenCalledOnce()
     expect(original.submit).not.toHaveBeenCalled()
     expect(found.agent.session.requestHeader()).toBeUndefined()
@@ -1088,6 +1210,41 @@ describe('official native session lifecycle', () => {
     expect(createClaudeSession).not.toHaveBeenCalled()
     expect(createCodexSession).not.toHaveBeenCalled()
     expect(runtime.sessions.size).toBe(0)
+  }, 10_000)
+
+  it('rejects a session directory that does not exist with the location error instead of a filesystem error', async () => {
+    await expect(session.create('codex', undefined, join(cwd, 'bridge-missing-session-directory'))).rejects.toThrow('BRIDGE_CWD_INVALID: 会话目录必须是已存在的绝对目录。')
+    expect(createCodexSession).not.toHaveBeenCalled()
+    expect(runtime.sessions.size).toBe(0)
+  }, 10_000)
+
+  it('refreshes official permission presets for each turn on a cached native connection', async () => {
+    context.provide('shell', { sandboxMode: 'workspace-write' })
+    await context.plugin(ApprovalService, { policy: 'ask' }).await()
+    await context.plugin(PermissionPresetService).await()
+    const connection = native('permission-native')
+    vi.mocked(createCodexSession).mockImplementation(async (_command, _cwd, _storedId, output) => {
+      connection.submit.mockImplementation(async () => output.assistant('permission-answer', [{ type: 'text', text: 'permission reply' }]))
+      return connection
+    })
+    await creating()
+    const agent = officialHandle!.agent
+    await followup(agent, 'use the pinned initial permissions')
+    context.permissionPresets.set(agent.session, 'danger-full-access')
+    await followup(agent, 'use full permissions without reconnecting')
+    context.permissionPresets.set(agent.session, 'workspace-write')
+    await followup(agent, 'restore approval mode without reconnecting')
+    expect(errors).toEqual([])
+    expect(createCodexSession).toHaveBeenCalledOnce()
+    expect(connection.submit.mock.calls.map(call => call[3])).toEqual([
+      { sandbox: 'workspace-write', approval: 'ask' },
+      { sandbox: 'danger-full-access', approval: 'never' },
+      { sandbox: 'workspace-write', approval: 'ask' },
+    ])
+    await session.remove(agent.id, agent)
+    vi.mocked(createCodexSession).mockClear()
+    await session.connect(agent, new AbortController().signal)
+    expect(vi.mocked(createCodexSession).mock.calls[0]![5]).toEqual({ permission: { sandbox: 'workspace-write', approval: 'ask' } })
   }, 10_000)
 
   it.each(['codex', 'claude'] as const)('publishes %s only after native ACK and official identity commit', async (id) => {
@@ -1195,7 +1352,6 @@ describe('official native session lifecycle', () => {
     }
     context.tools.register(tool)
     const delivered = deferred<void>()
-    const dispatched = deferred<void>()
     const connection = native('wait-only-native')
     releases.push(() => delivered.resolve())
     vi.mocked(createCodexSession).mockImplementation(async (_command, _cwd, _storedId, output) => {
@@ -1211,17 +1367,12 @@ describe('official native session lifecycle', () => {
     await creating()
     const agent = officialHandle!.agent
     const { events } = observe(agent)
-    agent.ctx.on('tools/execute', async (exec, next) => {
-      if (exec.callId === 'native-wait')
-        dispatched.resolve()
-      return next()
-    })
     let idle = false
     const turn = followup(agent, 'read through the native kernel').then(() => {
       idle = true
     })
     background.push(turn)
-    await dispatched.promise
+    await vi.waitFor(() => expect(events.filter(event => event.type === 'tool/call').map(event => event.data.callId)).toEqual(['native-wait']))
     expect(idle).toBe(false)
     expect(body).not.toHaveBeenCalled()
     expect(connection.submit).toHaveBeenCalledOnce()

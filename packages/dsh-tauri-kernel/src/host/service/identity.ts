@@ -67,8 +67,6 @@ export const identity = defineService({
       const fallback = ctx.get('agentDefaultModel')?.currentSelection()
       if ((agent.options.provider === undefined && agent.options.model === undefined) || (agent.options.provider === fallback?.provider && agent.options.model === fallback?.model)) {
         identity.hydrate(agent)
-        if (agent.session.requestHeader() === undefined && !agent.session.snapshotEvents().some(event => event.type === 'model/selection'))
-          runtime.coldRoutes.add(agent)
       }
       else if (agent.options.provider === BRIDGE_PROVIDER && agent.options.model === binding.backend) {
         identity.hydrate(agent)
@@ -80,7 +78,6 @@ export const identity = defineService({
       unregister()
       if (runtime.bindingSchema === bindingSchema)
         runtime.bindingSchema = undefined
-      runtime.coldRoutes.clear()
     }
   },
 

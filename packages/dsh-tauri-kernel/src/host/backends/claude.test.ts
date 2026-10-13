@@ -1,5 +1,5 @@
 import type { Frame } from './process.fixture'
-import type { NativeSession, NativeSessionOpenOptions } from './types'
+import type { NativeAttachments, NativePermission, NativeSession, NativeSessionOpenOptions } from './types'
 import { spawn } from 'node:child_process'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -63,11 +63,14 @@ function claudeProcess(options: {
   return fixture
 }
 
-async function open(nativeId: string | null = null, sink = createSink(), options?: NativeSessionOpenOptions) {
-  const session = await createClaudeSession(command, 'C:/fixture/workspace', nativeId, sink, new AbortController().signal, options)
+async function open(nativeId: string | null = null, sink = createSink(), options?: NativeSessionOpenOptions, attachments?: NativeAttachments) {
+  const session = await createClaudeSession(command, 'C:/fixture/workspace', nativeId, sink, new AbortController().signal, options, attachments)
   sessions.push(session)
   return session
 }
+
+/** Official image block; the attachment brand is opaque to this package. */
+const image = (attachment: { id: string, mediaType: string, bytes: number }) => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'image', attachment } as never] })
 
 const modelInfo = (value: string, levels: string[] = ['low', 'high']) => ({ value, displayName: `Native ${value}`, description: `${value} description`, supportsEffort: true, supportedEffortLevels: levels })
 const user = () => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'inspect the workspace' }] })
@@ -98,6 +101,9 @@ describe('claude native stream-json control contract', () => {
       '--include-partial-messages',
       '--permission-prompt-tool',
       'stdio',
+      '--allow-dangerously-skip-permissions',
+      '--settings',
+      '{"useAutoModeDuringPlan":false}',
       `--session-id=${session.id}`,
     ])
     expect(spawn).toHaveBeenCalledWith('C:/fixture/claude.exe', args, {
@@ -480,20 +486,34 @@ describe('claude native stream-json control contract', () => {
     ])
   })
 
-  it.each(['resume', 'fork'] as const)('clears inherited model and effort flags before the first null selection after %s', async (mode) => {
-    const fixture = claudeProcess({ useSystemInit: true, model: 'persisted-override' })
+  it.each(['resume', 'fork'] as const)('clears model and effort flags on an explicit reset after an override following %s', async (mode) => {
+    const fixture = claudeProcess({ useSystemInit: true, model: 'persisted-override', models: [modelInfo('chosen')] })
     const session = await open(mode === 'resume' ? storedId : null, createSink(), mode === 'fork' ? { forkFrom: storedId } : undefined)
-    const input = fixture.next(frame => frame.type === 'user')
-    const submitted = session.submit([user()], new AbortController().signal, { model: null, reasoningEffort: null })
-    await input
+    const signal = new AbortController().signal
+    const first = fixture.next(frame => frame.type === 'user')
+    const inherited = session.submit([user()], signal, { model: null, reasoningEffort: null })
+    await first
     result(fixture, session.id)
-    await submitted
+    await inherited
+    expect(fixture.frames.filter(frame => frame.type === 'control_request').map(frame => frame.request)).toEqual([initialization])
+    const changed = fixture.next(frame => frame.type === 'user')
+    const override = session.submit([user()], signal, { model: 'chosen', reasoningEffort: 'high' })
+    await changed
+    result(fixture, session.id)
+    await override
+    const reset = fixture.next(frame => frame.type === 'user')
+    const restored = session.submit([user()], signal, { model: null, reasoningEffort: null })
+    await reset
+    result(fixture, session.id)
+    await restored
     expect(fixture.frames.filter(frame => frame.type === 'control_request').map(frame => frame.request)).toEqual([
       initialization,
+      { subtype: 'set_model', model: 'chosen' },
+      { subtype: 'apply_flag_settings', settings: { effortLevel: 'high' } },
       { subtype: 'set_model', model: null },
       { subtype: 'apply_flag_settings', settings: { effortLevel: null } },
     ])
-    expect(fixture.frames.filter(frame => frame.type === 'user')).toHaveLength(1)
+    expect(fixture.frames.filter(frame => frame.type === 'user')).toHaveLength(3)
     expect(spawn).toHaveBeenCalledTimes(1)
   })
 
@@ -621,6 +641,20 @@ describe('claude native stream-json control contract', () => {
     await rejected
     expect(fixture.frames.some(frame => frame.type === 'user' || (frame.type === 'control_request' && (frame.request as Frame).subtype === 'interrupt'))).toBe(false)
     expect(fixture.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it.each(['resume', 'fork'] as const)('preserves inherited native settings on the first null preference after %s without model discovery', async (mode) => {
+    const fixture = claudeProcess({ useSystemInit: true, model: 'inherited-native-model', intercept: (frame, child) => {
+      if (frame.type !== 'user')
+        return false
+      result(child, String(frame.session_id))
+      return true
+    } })
+    const session = await open(mode === 'resume' ? storedId : null, createSink(), mode === 'fork' ? { forkFrom: storedId } : undefined)
+    await session.submit([user()], new AbortController().signal, { model: null, reasoningEffort: null })
+    expect(fixture.frames.filter(frame => frame.type === 'control_request').map(frame => frame.request)).toEqual([initialization])
+    expect(fixture.frames.filter(frame => frame.type === 'user')).toHaveLength(1)
+    expect(spawn).toHaveBeenCalledOnce()
   })
 
   it('keeps live and authoritative block identities while suppressing a duplicate final frame', async () => {
@@ -786,6 +820,129 @@ describe('claude native stream-json control contract', () => {
     expect(sink.toolEnd.mock.calls).toEqual([['tool-1', 'not a git repository', true]])
   })
 
+  it.each(['ask', 'never'] as const)('applies native planning and workspace edits with %s approvals on each turn of a resumed session', async (approval) => {
+    const fixture = claudeProcess({ intercept: (frame, child) => {
+      if (frame.type !== 'user')
+        return false
+      result(child, String(frame.session_id))
+      return true
+    } })
+    const session = await open(storedId, createSink(), { permission: { sandbox: 'danger-full-access', approval } })
+    const signal = new AbortController().signal
+    await session.submit([user()], signal)
+    await session.submit([user()], signal, undefined, { sandbox: 'read-only', approval })
+    await session.submit([user()], signal, undefined, { sandbox: 'workspace-write', approval })
+    await session.submit([user()], signal, undefined, { sandbox: 'workspace-write', approval })
+    await session.submit([user()], signal, undefined, { sandbox: 'danger-full-access', approval })
+    expect(fixture.frames.filter(frame => frame.type === 'control_request').map(frame => frame.request)).toEqual([
+      initialization,
+      initialization,
+      { subtype: 'set_permission_mode', mode: approval === 'never' ? 'bypassPermissions' : 'default' },
+      { subtype: 'set_permission_mode', mode: 'plan' },
+      { subtype: 'set_permission_mode', mode: 'acceptEdits' },
+      { subtype: 'set_permission_mode', mode: 'acceptEdits' },
+      { subtype: 'set_permission_mode', mode: approval === 'never' ? 'bypassPermissions' : 'default' },
+    ])
+    expect(fixture.frames.filter(frame => frame.type === 'user')).toHaveLength(5)
+    expect(session.id).toBe(storedId)
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    { permission: { sandbox: 'read-only', approval: 'ask' }, tool: 'Write', input: { file_path: 'inside.txt', content: 'unsafe' } },
+    { permission: { sandbox: 'read-only', approval: 'ask' }, tool: 'Bash', input: { command: 'touch inside.txt' } },
+    { permission: { sandbox: 'read-only', approval: 'ask' }, tool: 'ExitPlanMode', input: {} },
+    { permission: { sandbox: 'workspace-write', approval: 'never' }, tool: 'Write', input: { file_path: '../outside.txt', content: 'unsafe' } },
+  ] as const)('denies $tool native escalation in $permission.sandbox/$permission.approval without asking', async ({ permission, tool, input }) => {
+    const fixture = claudeProcess()
+    const sink = createSink()
+    sink.approval.mockResolvedValue(true)
+    const session = await open(null, sink)
+    const entered = fixture.next(frame => frame.type === 'user')
+    const submitted = session.submit([user()], new AbortController().signal, undefined, permission)
+    await Promise.race([entered, submitted])
+    const answered = fixture.next(frame => frame.type === 'control_response')
+    fixture.send({ type: 'control_request', request_id: 'restricted-tool', request: { subtype: 'can_use_tool', tool_name: tool, tool_use_id: 'restricted-call', input } })
+    expect(await answered).toMatchObject({ response: { request_id: 'restricted-tool', response: { behavior: 'deny' } } })
+    expect(sink.approval).not.toHaveBeenCalled()
+    result(fixture, session.id)
+    await submitted
+  })
+
+  it('keeps an approval-only never policy in dontAsk instead of inferring full-access bypass', async () => {
+    const fixture = claudeProcess({ intercept: (frame, child) => {
+      if (frame.type !== 'user')
+        return false
+      result(child, String(frame.session_id))
+      return true
+    } })
+    const session = await open()
+    await session.submit([user()], new AbortController().signal, undefined, { approval: 'never' })
+    expect(fixture.frames.filter(frame => frame.type === 'control_request').map(frame => frame.request)).toEqual([initialization, initialization, { subtype: 'set_permission_mode', mode: 'dontAsk' }])
+  })
+
+  it('snapshots explicit permissions and awaits each mode change on the same native session', async () => {
+    const fixture = claudeProcess({ intercept: frame => frame.type === 'control_request' && (frame.request as Frame).subtype === 'set_permission_mode' })
+    const session = await open(storedId, createSink(), { permission: { sandbox: 'danger-full-access', approval: 'ask' } })
+    const permission: NativePermission = { sandbox: 'danger-full-access', approval: 'never' }
+    const mode = fixture.next(frame => frame.type === 'control_request' && (frame.request as Frame).subtype === 'set_permission_mode')
+    const submitted = session.submit([user()], new AbortController().signal, undefined, permission)
+    permission.sandbox = 'read-only'
+    permission.approval = 'ask'
+    const control = await mode
+    expect(control.request).toEqual({ subtype: 'set_permission_mode', mode: 'bypassPermissions' })
+    expect(fixture.frames.some(frame => frame.type === 'user')).toBe(false)
+    const input = fixture.next(frame => frame.type === 'user')
+    fixture.send({ type: 'control_response', response: { subtype: 'success', request_id: control.request_id, response: { mode: 'bypassPermissions' } } })
+    await input
+    result(fixture, session.id)
+    await submitted
+    const reset = fixture.next(frame => frame.type === 'control_request' && (frame.request as Frame).subtype === 'set_permission_mode')
+    const restored = session.submit([user()], new AbortController().signal, undefined, { sandbox: 'danger-full-access', approval: 'ask' })
+    const resetControl = await reset
+    expect(resetControl.request).toEqual({ subtype: 'set_permission_mode', mode: 'default' })
+    expect(fixture.frames.filter(frame => frame.type === 'user')).toHaveLength(1)
+    const second = fixture.next(frame => frame.type === 'user')
+    fixture.send({ type: 'control_response', response: { subtype: 'success', request_id: resetControl.request_id, response: { mode: 'default' } } })
+    await second
+    result(fixture, session.id)
+    await restored
+    expect(session.id).toBe(storedId)
+    expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['error', 'mismatched-mode'] as const)('fails closed on a permission control %s without submitting user input', async (outcome) => {
+    const fixture = claudeProcess({ intercept: (frame, child) => {
+      if (frame.type !== 'control_request' || (frame.request as Frame).subtype !== 'set_permission_mode')
+        return false
+      child.send({ type: 'control_response', response: outcome === 'error'
+        ? { subtype: 'error', request_id: frame.request_id, error: 'Mode denied by native policy' }
+        : { subtype: 'success', request_id: frame.request_id, response: { mode: 'bypassPermissions' } } })
+      return true
+    } })
+    const session = await open()
+    await expect(session.submit([user()], new AbortController().signal, undefined, { sandbox: 'danger-full-access', approval: 'ask' })).rejects.toMatchObject({ code: outcome === 'error' ? 'BRIDGE_NATIVE_REQUEST' : 'BRIDGE_PERMISSION_MISMATCH' })
+    expect(fixture.frames.some(frame => frame.type === 'user')).toBe(false)
+    expect(fixture.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it.each([
+    { tool: 'Bash', input: { command: 'echo first\necho second', description: 'Inspect environment', dangerouslyDisableSandbox: true }, reason: '\u001B[31mOutside sandbox\u001B[0m', details: 'Outside sandbox\n\nInspect environment\n\ncommand: echo first\necho second\n\ndangerouslyDisableSandbox: true' },
+    { tool: 'WebSearch', input: { query: 'Claude protocol', allowed_domains: ['example.org'] }, reason: 'Network permission', details: 'Network permission\n\nquery: Claude protocol\n\nallowed_domains: [\n  "example.org"\n]' },
+    { tool: 'Write', input: { file_path: '../outside.txt', content: 'full file contents' }, reason: 'External file write', details: 'External file write\n\nfile_path: ../outside.txt\n\ncontent: full file contents' },
+  ])('formats $tool approval without hiding input while preserving denial', async ({ tool, input, reason, details }) => {
+    const fixture = claudeProcess()
+    const sink = createSink()
+    const session = await open(null, sink)
+    const submitted = session.submit([user()], new AbortController().signal)
+    const answered = fixture.next(frame => frame.type === 'control_response')
+    fixture.send({ type: 'control_request', request_id: 'readable-permission', request: { subtype: 'can_use_tool', tool_name: tool, tool_use_id: 'readable-tool', input, decision_reason: reason } })
+    expect(await answered).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'readable-permission', response: { behavior: 'deny', message: 'Native tool request is unavailable or cancelled' } } })
+    expect(sink.approval.mock.calls[0]?.[1].details).toBe(details)
+    result(fixture, session.id)
+    await submitted
+  })
+
   it('returns nested permission allow-once with the original native input', async () => {
     const fixture = claudeProcess()
     const sink = createSink()
@@ -795,17 +952,19 @@ describe('claude native stream-json control contract', () => {
     const answered = fixture.next(frame => frame.type === 'control_response' && (frame.response as Frame).request_id === 'permission-1')
     fixture.send({ type: 'control_request', request_id: 'permission-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'tool-approval', input: { command: 'git status' }, title: 'Read repository state' } })
     expect(await answered).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'permission-1', response: { behavior: 'allow', updatedInput: { command: 'git status' } } } })
-    expect(sink.approval.mock.calls[0]?.slice(0, 2)).toEqual(['tool-approval', { kind: 'command', title: 'Read repository state', details: '{"tool":"Bash","input":{"command":"git status"}}' }])
+    expect(sink.approval.mock.calls[0]?.slice(0, 2)).toEqual(['tool-approval', { kind: 'command', title: 'Read repository state', details: 'command: git status' }])
     result(fixture, session.id)
     await submitted
   })
 
-  it('maps AskUserQuestion multi-selection back into native updatedInput answers', async () => {
+  it.each([undefined, { sandbox: 'read-only', approval: 'ask' }] as const)('maps AskUserQuestion multi-selection back into native updatedInput answers under %j', async (permission) => {
     const fixture = claudeProcess()
     const sink = createSink()
     sink.questions.mockResolvedValue({ 'Which areas?': ['Events', 'Cancel'] })
     const session = await open(null, sink)
-    const submitted = session.submit([user()], new AbortController().signal)
+    const entered = fixture.next(frame => frame.type === 'user')
+    const submitted = session.submit([user()], new AbortController().signal, undefined, permission)
+    await Promise.race([entered, submitted])
     const answered = fixture.next(frame => frame.type === 'control_response')
     const input = { questions: [{ question: 'Which areas?', header: 'Scope', multiSelect: true, options: [{ label: 'Events', description: 'Logs and UI' }, { label: 'Cancel', description: 'Quiescence' }] }] }
     fixture.send({ type: 'control_request', request_id: 'questions-1', request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion', tool_use_id: 'question-tool', input } })
@@ -927,6 +1086,40 @@ describe('claude native stream-json control contract', () => {
     await rejected
     expect(session.id).toBe(storedId)
     expect(spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the official text and image order in one mixed native prompt', async () => {
+    const fixture = claudeProcess()
+    const attachments: NativeAttachments = { path: () => undefined, read: vi.fn(async () => ({ mediaType: 'image/png', base64: 'Zm FrZQ==' })) }
+    const session = await open(null, createSink(), undefined, attachments)
+    const mixed = createUserMessage({ source: { kind: 'user' }, content: [
+      { type: 'text', text: 'before ' },
+      { type: 'image', attachment: { id: 'image-1', mediaType: 'image/png', bytes: 3 } as never },
+      { type: 'text', text: ' after' },
+    ] })
+    const submitted = session.submit([mixed], new AbortController().signal)
+    result(fixture, session.id)
+    await submitted
+    expect(fixture.frames.filter(frame => frame.type === 'user').flatMap(frame => (frame.message as Frame).content as Frame[])).toEqual([
+      { type: 'text', text: 'before ' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'Zm FrZQ==' } },
+      { type: 'text', text: ' after' },
+    ])
+  })
+
+  it('forwards an official image as an inline base64 content block', async () => {
+    const fixture = claudeProcess()
+    const attachments: NativeAttachments = { path: () => undefined, read: vi.fn(async () => ({ mediaType: 'image/png', base64: 'Zm FrZQ==' })) }
+    const session = await open(null, createSink(), undefined, attachments)
+    const submitted = session.submit([user(), image({ id: 'image-1', mediaType: 'image/png', bytes: 3 })], new AbortController().signal)
+    result(fixture, session.id)
+    await submitted
+    expect(fixture.frames.filter(frame => frame.type === 'user')).toEqual([
+      { type: 'user', session_id: session.id, uuid: expect.any(String), parent_tool_use_id: null, message: { role: 'user', content: [
+        { type: 'text', text: 'inspect the workspace' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'Zm FrZQ==' } },
+      ] } },
+    ])
   })
 
   it('rejects nontext input instead of sending only its text portion', async () => {

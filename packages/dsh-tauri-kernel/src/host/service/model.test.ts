@@ -297,6 +297,49 @@ function checkUnchangedRoute(agent: Agent, started = false) {
   expect(context.agentDefaultModel.currentSelection()).toEqual({ provider: 'global-provider', model: 'global-model', reasoningEffort: 'global-effort' })
 }
 
+describe('official native skill catalog admission', () => {
+  it.each(['codex', 'claude'] as const)('omits DSH skill catalogs from %s input without cancelling catalog updates or removing explicit instructions', async (backend) => {
+    const catalogText = '<available_skills>find-skills</available_skills>'
+    const catalog = llmModule.createUserMessage({
+      source: { kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'find-skills', description: 'DSH-only skill' }] } as unknown as llmModule.UserMessage['source'],
+      content: [{ type: 'text', text: catalogText }],
+    })
+    const update = llmModule.createUserMessage({
+      source: { ...catalog.source, update: true } as unknown as llmModule.UserMessage['source'],
+      content: [{ type: 'text', text: '<available_skills>replacement</available_skills>' }],
+    })
+    const invocation = llmModule.createUserMessage({
+      source: { kind: 'skill-invocation', name: 'find-skills', form: 'instructions' } as unknown as llmModule.UserMessage['source'],
+      content: [{ type: 'text', text: '<skill_content name="find-skills">explicit instructions</skill_content>' }],
+    })
+    context.on('agent/pre-step', async ({ step }, next) => {
+      const decision = await next()
+      return decision.kind === 'reject' ? decision : { ...decision, messages: [...decision.messages, ...step === 1 ? [catalog, invocation] : [update]] }
+    })
+    const connection = native(`skills-${backend}`)
+    vi.mocked(backend === 'codex' ? createCodexSession : createClaudeSession).mockImplementationOnce(async (_command, _cwd, _storedId, output) => {
+      connection.submit.mockImplementation(async () => {
+        output.assistant('native-skill-call', [{ type: 'tool-call', id: 'native-skill', name: 'Skill', arguments: '{"skill":"keybindings-help"}' }])
+        output.toolStart('native-skill', 'Skill', '{"skill":"keybindings-help"}')
+        output.toolEnd('native-skill', 'native skill instructions')
+        output.assistant('native-skill-finished', [{ type: 'text', text: 'native skill finished' }])
+      })
+      return connection
+    })
+    const created = await session.create(backend, undefined, cwd)
+    const agent = agents.get(sessionModule.SessionId(created.sessionId))!
+    await followup(agent, catalogText)
+    expect(connection.submit).toHaveBeenCalledOnce()
+    expect(connection.submit.mock.calls[0]![0].map(message => ({ source: message.source, content: message.content }))).toEqual([
+      { source: { kind: 'user' }, content: [{ type: 'text', text: catalogText }] },
+      { source: invocation.source, content: [{ type: 'text', text: '<skill_content name="find-skills">explicit instructions</skill_content>' }] },
+    ])
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'step/start').map(event => event.data)).toEqual([{ turn: 1, step: 1 }, { turn: 1, step: 2 }])
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'turn/end').map(event => event.data)).toEqual([{ turn: 1, reason: { kind: 'completed' } }])
+    expect(errors).toEqual([])
+  }, 10_000)
+})
+
 describe('official native model selection', () => {
   it.each(['codex', 'claude'] as const)('reads the actual %s catalog without submitting or creating model records', async (backend) => {
     const { agent, connection } = await create(native(`catalog-${backend}`), backend)

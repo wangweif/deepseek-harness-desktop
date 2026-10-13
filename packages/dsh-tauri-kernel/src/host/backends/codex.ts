@@ -1,7 +1,7 @@
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Deferred } from './transport'
-import type { NativeCommand, NativeContent, NativeModelCatalog, NativeModelInfo, NativeQuestion, NativeSession, NativeSessionOpenOptions, NativeSink, NativeTurnOptions } from './types'
-import { abortError, deferred, errorFrom, INTERRUPT_TIMEOUT_MS, JsonLinesProcess, NativeBridgeError, PendingRequests, record, REQUEST_TIMEOUT_MS, stringField, textMessages } from './transport'
+import type { NativeAttachments, NativeCommand, NativeContent, NativeImageRef, NativeModelCatalog, NativeModelInfo, NativePermission, NativeQuestion, NativeSession, NativeSessionOpenOptions, NativeSink, NativeTurnOptions } from './types'
+import { abortError, deferred, errorFrom, INTERRUPT_TIMEOUT_MS, JsonLinesProcess, NativeBridgeError, nativeRuns, PendingRequests, record, REQUEST_TIMEOUT_MS, stringField } from './transport'
 
 const INITIALIZATION = {
   clientInfo: { name: 'dsh-tauri-kernel', title: 'DSH native session bridge', version: '1.0.0' },
@@ -47,6 +47,48 @@ interface CodexTurn {
   interruptTimer?: ReturnType<typeof setTimeout>
 }
 
+/**
+ * Human-readable approval text: the native reason plus only the fields that
+ * identify what is being approved. The raw request envelope (ids, timestamps,
+ * decision menus) is protocol plumbing and is unreadable in a permission prompt.
+ */
+function approvalDetails(fallback: string, params: Record<string, unknown>, fields: readonly string[], extra: readonly string[] = []): string {
+  const lines = [typeof params.reason === 'string' && params.reason.trim() !== '' ? params.reason : fallback]
+  for (const field of fields) {
+    const value = params[field]
+    if (value === undefined || value === null || value === '')
+      continue
+    lines.push(`${field}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+  }
+  return [...lines, ...extra].join('\n')
+}
+
+/**
+ * Read the proposed file changes a `fileChange` item carries. The approval
+ * request itself names no files, so the prompt can only list them from the item
+ * the native kernel announced for the same identity.
+ */
+function changedLines(item: Record<string, unknown>): string[] {
+  if (!Array.isArray(item.changes))
+    return []
+  return item.changes.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return []
+    const path = (value as Record<string, unknown>).path
+    return typeof path === 'string' && path !== '' ? [path] : []
+  })
+}
+
+/**
+ * Whether the native request still offers a plain one-shot `accept`. The DSH
+ * approval seam only grants `allowed-once`, so a decision menu without that
+ * entry cannot be answered truthfully; cancelling leaves the choice to the user
+ * instead of silently minting an execpolicy amendment or a session-scoped grant.
+ */
+function acceptsOnce(params: Record<string, unknown>): boolean {
+  return !Array.isArray(params.availableDecisions) || params.availableDecisions.includes('accept')
+}
+
 function nativeTool(item: Record<string, unknown>): { name: string, arguments: string } | undefined {
   switch (item.type) {
     case 'commandExecution':
@@ -87,6 +129,8 @@ class CodexSession implements NativeSession {
   private readonly interruptedTurns = new Set<string>()
   private backgroundBaseline?: Set<string>
   private readonly commandItems = new Set<string>()
+  /** Proposed file changes per announced `fileChange` item, for its approval prompt. */
+  private readonly changedFiles = new Map<string, string[]>()
   private baselineModel?: string
   private baselineProvider?: string
   private baselineEffort?: string | null
@@ -96,7 +140,7 @@ class CodexSession implements NativeSession {
   private appliedOptions: NativeTurnOptions = { model: null, reasoningEffort: null }
   private effortOverridden = false
 
-  constructor(private readonly command: NativeCommand, private readonly sink: NativeSink, private readonly cwd: string) {
+  constructor(private readonly command: NativeCommand, private readonly sink: NativeSink, private readonly cwd: string, private readonly attachments?: NativeAttachments) {
     this.transport = new JsonLinesProcess(command, ['app-server', '--listen', 'stdio://'], cwd)
     this.requests = new PendingRequests(value => this.transport.write(value))
     this.transport.onFailure((error) => {
@@ -122,9 +166,12 @@ class CodexSession implements NativeSession {
       await this.request('initialize', INITIALIZATION, signal)
       this.transport.write({ method: 'initialized', params: {} })
       const forkFrom = options?.forkFrom
+      const permission = options?.permission
       const response = record(await this.request(forkFrom ? 'thread/fork' : storedId === null ? 'thread/start' : 'thread/resume', {
         ...forkFrom ? { threadId: forkFrom } : storedId === null ? {} : { threadId: storedId },
         cwd,
+        ...permission?.approval === undefined ? {} : { approvalPolicy: permission.approval === 'never' ? 'never' : 'on-request' },
+        ...permission?.sandbox === undefined ? {} : { sandbox: permission.sandbox },
       }, signal))
       const id = stringField(record(response.thread), 'id')
       if (storedId !== null && id !== storedId)
@@ -282,7 +329,7 @@ class CodexSession implements NativeSession {
   private async turnOptions(options: NativeTurnOptions, signal: AbortSignal): Promise<{ model?: string, effort?: string }> {
     const modelChanged = this.defaultsPending || options.model !== this.appliedOptions.model
     const effortChanged = this.defaultsPending || options.reasoningEffort !== this.appliedOptions.reasoningEffort
-    if (options.model === null && options.reasoningEffort === null && !modelChanged && !effortChanged)
+    if (options.model === null && options.reasoningEffort === null && this.appliedOptions.model === null && this.appliedOptions.reasoningEffort === null)
       return {}
     const catalog = this.catalog ?? await this.models(signal)
     const model = options.model ?? this.baselineModel
@@ -303,16 +350,27 @@ class CodexSession implements NativeSession {
     return { ...options.model !== null || modelChanged ? { model } : {}, ...effort === null ? {} : { effort } }
   }
 
-  async submit(messages: readonly UserMessage[], signal: AbortSignal, options?: NativeTurnOptions): Promise<void> {
+  async submit(messages: readonly UserMessage[], signal: AbortSignal, options?: NativeTurnOptions, permission?: NativePermission): Promise<void> {
     signal.throwIfAborted()
     if (this.disposed || this.failure)
       throw this.failure ?? new NativeBridgeError('BRIDGE_PROCESS_CLOSED', 'Codex session was disposed')
     if (this.active)
       throw new NativeBridgeError('BRIDGE_BUSY', 'Codex native session already has an active turn')
-    const input = textMessages(messages).map(text => ({ type: 'text', text, text_elements: [] }))
-    if (input.length === 0)
+    const runs = nativeRuns(messages, this.attachments)
+    if (runs.length === 0)
       throw new NativeBridgeError('BRIDGE_EMPTY_INPUT', 'Codex native turn requires a user message')
+    this.changedFiles.clear()
     const selection = options ? { ...options } : undefined
+    const policy = {
+      ...permission?.approval === undefined ? {} : { approvalPolicy: permission.approval === 'never' ? 'never' : 'on-request' },
+      ...permission?.sandbox === undefined
+        ? {}
+        : { sandboxPolicy: {
+            'read-only': { type: 'readOnly', networkAccess: false },
+            'workspace-write': { type: 'workspaceWrite', writableRoots: [this.cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+            'danger-full-access': { type: 'dangerFullAccess' },
+          }[permission.sandbox] },
+    }
     const turn: CodexTurn = {
       result: deferred<void>(),
       signal,
@@ -334,14 +392,24 @@ class CodexSession implements NativeSession {
     signal.addEventListener('abort', aborted, { once: true })
     try {
       const overrides = selection ? await this.turnOptions(selection, signal) : {}
+      const input: Record<string, unknown>[] = []
+      for (const run of runs.flat()) {
+        if (run.type === 'text') {
+          input.push({ type: 'text', text: run.text, text_elements: [] })
+          continue
+        }
+        input.push(await this.imageInput(run.ref, signal))
+      }
+      signal.throwIfAborted()
       turn.baseline = new Set((await this.listTerminals(signal)).map(terminal => terminal.processId))
       signal.throwIfAborted()
       turn.submitted = true
       // turn/started may precede the response; retain its id even during cancel.
-      const response = record(await this.request('turn/start', { threadId: this.id, input, ...overrides }))
+      const response = record(await this.request('turn/start', { threadId: this.id, input, ...overrides, ...policy }))
       if (selection) {
         this.appliedOptions = selection
-        this.defaultsPending = false
+        if (overrides.model !== undefined || overrides.effort !== undefined)
+          this.defaultsPending = false
       }
       if (overrides.model !== undefined)
         this.effectiveModel = overrides.model
@@ -527,6 +595,14 @@ class CodexSession implements NativeSession {
       case 'turn/started':
         return
       case 'turn/completed': {
+        if (Array.isArray(nativeTurn!.items)) {
+          for (const value of nativeTurn!.items) {
+            const item = record(value)
+            const tool = turn.tools.get(stringField(item, 'id'))
+            if (tool && !tool.ended && (item.status === 'completed' || item.status === 'failed' || item.status === 'declined'))
+              this.item(turn, item, true)
+          }
+        }
         const status = stringField(nativeTurn!, 'status')
         if (status === 'interrupted' && !turn.signal.aborted)
           turn.terminalError = new NativeBridgeError('BRIDGE_NATIVE_INTERRUPTED', 'Codex interrupted the native turn')
@@ -560,7 +636,8 @@ class CodexSession implements NativeSession {
           this.sink.thinking(id, delta)
         return
       }
-      case 'item/commandExecution/outputDelta': {
+      case 'item/commandExecution/outputDelta':
+      case 'item/fileChange/outputDelta': {
         const tool = turn.tools.get(stringField(params, 'itemId'))
         if (tool)
           tool.output += typeof params.delta === 'string' ? params.delta : ''
@@ -574,9 +651,15 @@ class CodexSession implements NativeSession {
 
   private item(turn: CodexTurn, item: Record<string, unknown>, completed: boolean): void {
     const id = stringField(item, 'id')
+    const type = stringField(item, 'type')
     if (item.type === 'commandExecution') {
       turn.commandItems.add(id)
       this.commandItems.add(id)
+    }
+    else if (item.type === 'fileChange') {
+      const lines = changedLines(item)
+      if (lines.length > 0)
+        this.changedFiles.set(id, lines)
     }
     const tool = nativeTool(item)
     if (tool) {
@@ -597,7 +680,7 @@ class CodexSession implements NativeSession {
     if (!completed || turn.assistants.has(id))
       return
     const content: NativeContent[] = []
-    switch (item.type) {
+    switch (type) {
       case 'agentMessage':
       case 'plan':
         content.push({ type: 'text', text: typeof item.text === 'string' ? item.text : turn.text.get(id) ?? '' })
@@ -618,10 +701,22 @@ class CodexSession implements NativeSession {
         content.push({ type: 'text', text: typeof item.review === 'string' ? item.review : '' })
         break
       default:
-        throw new NativeBridgeError('BRIDGE_UNSUPPORTED_EVENT', `Unsupported Codex item type: ${String(item.type)}`)
+        content.push({ type: 'text', text: JSON.stringify(item) })
+        break
     }
     turn.assistants.add(id)
     this.sink.assistant(id, content)
+  }
+
+  /** Official image as native `UserInput`; a host path avoids re-encoding the bytes. */
+  private async imageInput(ref: NativeImageRef, signal: AbortSignal): Promise<Record<string, unknown>> {
+    const path = this.attachments?.path(ref)
+    if (path !== undefined)
+      return { type: 'localImage', path }
+    const source = await this.attachments!.read(ref, signal)
+    if (source.base64 === undefined)
+      throw new NativeBridgeError('BRIDGE_PROTOCOL', 'The official attachment store returned no readable image bytes')
+    return { type: 'image', url: `data:${source.mediaType};base64,${source.base64}` }
   }
 
   private async answer(id: string | number, method: string, params: Record<string, unknown>): Promise<void> {
@@ -639,13 +734,14 @@ class CodexSession implements NativeSession {
           ? await this.sink.approval(itemId, {
               kind: command ? 'command' : 'file',
               title: command && typeof params.command === 'string' ? params.command : command ? 'Codex command execution' : 'Codex file changes',
-              details: JSON.stringify(params),
+              details: approvalDetails(command ? 'Codex needs to run a command' : 'Codex needs to change files', params, command ? ['command', 'cwd'] : ['grantRoot'], command ? [] : this.changedFiles.get(itemId) ?? []),
             }, signal)
           : false
-        result = { decision: allowed && !signal.aborted ? 'accept' : 'decline' }
+        const once = acceptsOnce(params)
+        result = { decision: once ? (allowed && !signal.aborted ? 'accept' : 'decline') : 'cancel' }
       }
       else if (method === 'item/permissions/requestApproval') {
-        const allowed = belongs ? await this.sink.approval(itemId, { kind: 'tool', title: 'Codex additional permissions', details: JSON.stringify(params) }, signal) : false
+        const allowed = belongs ? await this.sink.approval(itemId, { kind: 'tool', title: 'Codex additional permissions', details: approvalDetails('Codex requests additional permissions', params, ['permissions']) }, signal) : false
         result = { permissions: allowed && !signal.aborted ? record(params.permissions) : {}, scope: 'turn' }
       }
       else if (method === 'item/tool/requestUserInput') {
@@ -689,10 +785,10 @@ class CodexSession implements NativeSession {
   }
 }
 
-export async function createCodexSession(command: NativeCommand, cwd: string, nativeSessionId: string | null, sink: NativeSink, signal: AbortSignal, options?: NativeSessionOpenOptions): Promise<NativeSession> {
+export async function createCodexSession(command: NativeCommand, cwd: string, nativeSessionId: string | null, sink: NativeSink, signal: AbortSignal, options?: NativeSessionOpenOptions, attachments?: NativeAttachments): Promise<NativeSession> {
   if (options?.forkFrom !== undefined && (nativeSessionId !== null || options.forkFrom === ''))
     throw new NativeBridgeError('BRIDGE_FORK_INVALID', 'Codex fork requires a source thread and no existing native binding')
-  const session = new CodexSession(command, sink, cwd)
+  const session = new CodexSession(command, sink, cwd, attachments)
   await session.open(cwd, nativeSessionId, signal, options)
   return session
 }

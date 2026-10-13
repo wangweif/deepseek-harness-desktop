@@ -14,7 +14,6 @@ export async function loadRuntimeModules(loader: PlatformLoader): Promise<Runtim
   const [llm, session] = await Promise.all([loader.import('@deepseek-ai/dsh-llm'), loader.import('@deepseek-ai/dsh-session')])
   return {
     ToolCallId: resolveExport(loader, llm, 'ToolCallId'),
-    HarnessError: resolveExport(loader, llm, 'HarnessError'),
     LlmAdapter: resolveExport(loader, llm, 'LlmAdapter'),
     isAgentLoopRequest: resolveExport(loader, llm, 'isAgentLoopRequest'),
     appendPluginRecord: optionalExport(loader, session, 'appendPluginRecord'),

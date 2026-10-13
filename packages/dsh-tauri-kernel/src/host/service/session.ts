@@ -1,10 +1,12 @@
 import type { Agent, AgentHandle, AgentSetupCommit } from '@deepseek-ai/dsh-agent'
+import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type { KernelBinding } from '../../shared/types'
-import type { NativeSession, NativeSessionOpenOptions, NativeSink } from '../backends/types'
+import type { NativeAttachments, NativePermission, NativeSession, NativeSessionOpenOptions, NativeSink } from '../backends/types'
 import type { HostContext, NativeEntry, NativeExecution } from '../types'
 import type { OfficialSink } from './sink.types'
+import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 import { mkdir, realpath, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
@@ -12,7 +14,8 @@ import { getServerContext } from 'dsh-h3/utils'
 import { defineService, resolveUngroupedSessionPath } from 'dsh-tauri'
 import { createClaudeSession } from '../backends/claude'
 import { createCodexSession } from '../backends/codex'
-import { BRIDGE_PROVIDER, KERNEL_RECORD_TYPE } from '../config/constants'
+import { NativeBridgeError } from '../backends/transport'
+import { BRIDGE_PROVIDER, KERNEL_RECORD_TYPE, SESSION_TITLE_PURPOSE } from '../config/constants'
 import { resetRuntime, runtime } from '../config/runtime'
 import { server } from '../server'
 import { waitFor } from '../utils/abort'
@@ -40,7 +43,8 @@ export const session = defineService({
       cwd = resolveUngroupedSessionPath()
       await mkdir(cwd, { recursive: true })
     }
-    if (!isAbsolute(cwd) || !(await stat(cwd)).isDirectory())
+    const location = await stat(cwd).catch(() => undefined)
+    if (!isAbsolute(cwd) || location?.isDirectory() !== true)
       throw new Error('BRIDGE_CWD_INVALID: 会话目录必须是已存在的绝对目录。')
     cwd = await realpath(cwd)
     lifetime.signal.throwIfAborted()
@@ -181,6 +185,27 @@ export const session = defineService({
       throw new Error('BRIDGE_AGENT_REPLACED: 工作树会话已关闭或被替换。')
   },
 
+  async* title(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const ctx = getServerContext<HostContext>(server)
+    const agent = options.sessionId === undefined ? undefined : ctx.agents.get(options.sessionId as SessionId)
+    if (!runtime.ready || options.provider !== BRIDGE_PROVIDER || options.purpose !== SESSION_TITLE_PURPOSE || !agent || ctx.sessions.get(agent.id) !== agent.session || options.signal === undefined || identity.resolve(agent).backend !== options.model)
+      throw new Error('BRIDGE_TITLE_REQUEST_INVALID: 标题请求缺少对应的原生会话。')
+    const route = ctx.get('agentDefaultModel')?.currentSelection()
+    if (!route || route.provider === BRIDGE_PROVIDER)
+      throw new Error('BRIDGE_TITLE_MODEL_UNAVAILABLE: 标题生成需要可用的 DSH 默认模型。')
+    const signal = AbortSignal.any([options.signal, runtime.lifetime.signal])
+    signal.throwIfAborted()
+    const call = await ctx.llm.prepareCall({
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+      maxTokens: options.maxTokens,
+      temperature: options.temperature,
+      stop: options.stop,
+    }, signal)
+    yield* call.stream({ ...options, ...call.config, signal })
+  },
+
   async connect(agent: Agent, signal: AbortSignal): Promise<NativeSession> {
     const binding = identity.resolve(agent)
     try {
@@ -233,7 +258,7 @@ export const session = defineService({
         state.signal.throwIfAborted()
         if (!sameBinding(entry.binding, input.binding))
           throw new Error('BRIDGE_RESUME_MISMATCH: 原生内核未恢复已绑定的会话。')
-        await entry.session.submit(input.messages, state.signal, input.options)
+        await entry.session.submit(input.messages, state.signal, input.options, permissionOf(input.agent.session))
         official.settle()
       }
       catch (error) {
@@ -464,7 +489,8 @@ async function connect(agent: Agent, id: KernelBinding['backend'], storedId: str
     questions: (...args) => activeSink(agent, controller).questions(...args),
   }
   const factory = id === 'codex' ? createCodexSession : createClaudeSession
-  const native = await factory(resolved.command, agent.session.header.cwd!, storedId, nativeSink, signal, options)
+  const permission = permissionOf(agent.session)
+  const native = await factory(resolved.command, agent.session.header.cwd!, storedId, nativeSink, signal, permission === undefined ? options : { ...options, permission }, nativeAttachments(getServerContext<HostContext>(server)))
   try {
     signal.throwIfAborted()
     if (!native.id || (storedId !== null && storedId !== native.id))
@@ -484,6 +510,22 @@ async function connect(agent: Agent, id: KernelBinding['backend'], storedId: str
   }
 }
 
+/** Official attachment access for native prompts; absent without an image provider. */
+function nativeAttachments(ctx: HostContext): NativeAttachments | undefined {
+  const store = ctx.get('attachments')
+  if (store === undefined)
+    return undefined
+  return {
+    path: ref => store.imageHostPath(ref),
+    async read(ref, signal) {
+      const stored = await store.readImage(ref, signal)
+      if (!(stored.data instanceof Uint8Array) || stored.ref.mediaType.length === 0)
+        throw new NativeBridgeError('BRIDGE_PROTOCOL', 'The official attachment store returned an unreadable image')
+      return { mediaType: stored.ref.mediaType, base64: Buffer.from(stored.data).toString('base64') }
+    },
+  }
+}
+
 function ownsSession(sessionId: string, owner: Agent): boolean {
   const entry = runtime.sessions.get(sessionId)
   const pending = runtime.pending.get(sessionId)
@@ -497,6 +539,13 @@ function activeSink(agent: Agent, controller: AbortController): NativeSink {
   if (runtime.controllers.get(agent.id) !== controller || exchange?.state.input.agent !== agent || exchange.state.native !== current)
     throw new Error('BRIDGE_NOTIFICATION_OUTSIDE_TURN: 原生内核在官方回合外或替换后输出。')
   return exchange.state.native
+}
+
+function permissionOf(value: Session): NativePermission | undefined {
+  const state = getServerContext<HostContext>(server).sessionProjections.stateOf(value, 'permissions')
+  if (!state || (state.sandbox === null && state.approval === null))
+    return undefined
+  return { sandbox: state.sandbox ?? undefined, approval: state.approval ?? undefined }
 }
 
 function sameBinding(left: KernelBinding | null | undefined, right: KernelBinding): boolean {
