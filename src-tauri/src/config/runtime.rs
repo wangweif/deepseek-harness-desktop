@@ -83,9 +83,14 @@ fn dsh_pkg_asset_filename() -> Result<String, String> {
     }
 }
 
-/// 打包的 DeepSeek Harness 发行版下载地址（GitHub 官方直连，首选源）
+/// 打包的 DeepSeek Harness 发行版下载地址（默认首选源）。
+///
+/// 基址取常量 `DSH_CORE_URL`（NONGKE #1：自管发版中心），环境变量
+/// `DSH_CORE_URL` 可覆盖（dev/测试指向本地平台；须以
+/// `releases/latest/download/` 结尾以保持 tag URL 推导同构）。
 pub fn get_dsh_download_url() -> Result<String, String> {
-    Ok(format!("{}{}", DSH_CORE_URL, dsh_pkg_asset_filename()?))
+    let base = std::env::var("DSH_CORE_URL").unwrap_or_else(|_| DSH_CORE_URL.to_string());
+    Ok(format!("{}{}", base, dsh_pkg_asset_filename()?))
 }
 
 /// 为任意 GitHub Release 资产 URL 生成全部镜像兜底地址
@@ -103,10 +108,12 @@ pub fn mirror_download_urls(asset_url: &str) -> Vec<String> {
 /// `releases/download/<tag>/`，镜像/直连与平台文件名逻辑与最新版完全一致
 /// （GitHub 的 tag 下载路径是固定的 release 资产地址，可被确定性推导）。
 pub fn get_dsh_download_url_for_tag(tag: &str) -> Result<String, String> {
-    let base = DSH_CORE_URL.replace(
-        "releases/latest/download/",
-        &format!("releases/download/{tag}/"),
-    );
+    let base = std::env::var("DSH_CORE_URL")
+        .unwrap_or_else(|_| DSH_CORE_URL.to_string())
+        .replace(
+            "releases/latest/download/",
+            &format!("releases/download/{tag}/"),
+        );
     Ok(format!("{}{}", base, dsh_pkg_asset_filename()?))
 }
 
