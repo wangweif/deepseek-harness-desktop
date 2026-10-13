@@ -9,9 +9,15 @@ pub const NODE_BASE_URL: &str = "https://nodejs.org/dist/";
 /// Node.js 镜像下载地址（npmmirror，302 重定向至 cdn.npmmirror.com）
 pub const NODE_MIRROR_BASE_URL: &str = "https://npmmirror.com/mirrors/node/";
 
-/// 打包的 DeepSeek Harness 发行版下载地址（GitHub Release，默认首选源）
+/// 打包的 DeepSeek Harness 发行版下载地址（NONGKE #1：自管发版中心，D1 形态 3）。
+///
+/// 默认指向 agent_platform 的内核发版中心（GitHub Release 兼容路径形态），
+/// 首启下载预补丁内核（官方 pkg + 我方 27 补丁重放）。运行时可用环境变量
+/// `DSH_CORE_URL` 覆盖（dev/测试指向本地平台）；值必须以
+/// `releases/latest/download/` 结尾——tag URL 以该后缀字符串替换推导
+/// （见 runtime::get_dsh_download_url_for_tag）。
 pub const DSH_CORE_URL: &str =
-    "https://github.com/dsh-tauri-desk/deepseek-harness-pkg/releases/latest/download/";
+    "https://ai.touchit.com.cn/agent/desktop/core/releases/latest/download/";
 
 /// GitHub Release 的代理镜像前缀列表（透传官方 URL，下载内容一致、
 /// 仍可做 SHA-256 完整性校验），按实测延迟从低到高排列，官方直连失败时依次兜底。
